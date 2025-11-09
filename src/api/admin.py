@@ -729,11 +729,48 @@ async def get_cache_config(token: str = Depends(verify_admin_token)):
     return {
         "success": True,
         "config": {
+            "enabled": config.cache_enabled,
             "timeout": config.cache_timeout,
             "base_url": config.cache_base_url,  # 返回实际配置的值，可能为空字符串
             "effective_base_url": config.cache_base_url or f"http://{config.server_host}:{config.server_port}"  # 实际生效的值
         }
     }
+
+@router.post("/api/cache/enabled")
+async def update_cache_enabled(
+    request: dict,
+    token: str = Depends(verify_admin_token)
+):
+    """Update cache enabled status"""
+    try:
+        enabled = request.get("enabled", True)
+
+        # Update config file
+        config_path = Path("config/setting.toml")
+        with open(config_path, "r", encoding="utf-8") as f:
+            config_data = toml.load(f)
+
+        if "cache" not in config_data:
+            config_data["cache"] = {}
+
+        config_data["cache"]["enabled"] = enabled
+
+        with open(config_path, "w", encoding="utf-8") as f:
+            toml.dump(config_data, f)
+
+        # Update in-memory config
+        config.set_cache_enabled(enabled)
+
+        # Reload config to ensure consistency
+        config.reload_config()
+
+        return {
+            "success": True,
+            "message": f"Cache {'enabled' if enabled else 'disabled'} successfully",
+            "enabled": enabled
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to update cache enabled status: {str(e)}")
 
 # Generation timeout config endpoints
 @router.get("/api/generation/timeout")
@@ -862,3 +899,53 @@ async def update_video_length_config(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to update video length config: {str(e)}")
+
+# AT auto refresh config endpoints
+@router.get("/api/token-refresh/config")
+async def get_at_auto_refresh_config(token: str = Depends(verify_admin_token)):
+    """Get AT auto refresh configuration"""
+    # Reload config from file to get latest values
+    config.reload_config()
+
+    return {
+        "success": True,
+        "config": {
+            "at_auto_refresh_enabled": config.at_auto_refresh_enabled
+        }
+    }
+
+@router.post("/api/token-refresh/enabled")
+async def update_at_auto_refresh_enabled(
+    request: dict,
+    token: str = Depends(verify_admin_token)
+):
+    """Update AT auto refresh enabled status"""
+    try:
+        enabled = request.get("enabled", False)
+
+        # Update config file
+        config_path = Path("config/setting.toml")
+        with open(config_path, "r", encoding="utf-8") as f:
+            config_data = toml.load(f)
+
+        if "token_refresh" not in config_data:
+            config_data["token_refresh"] = {}
+
+        config_data["token_refresh"]["at_auto_refresh_enabled"] = enabled
+
+        with open(config_path, "w", encoding="utf-8") as f:
+            toml.dump(config_data, f)
+
+        # Update in-memory config
+        config.set_at_auto_refresh_enabled(enabled)
+
+        # Reload config to ensure consistency
+        config.reload_config()
+
+        return {
+            "success": True,
+            "message": f"AT auto refresh {'enabled' if enabled else 'disabled'} successfully",
+            "enabled": enabled
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to update AT auto refresh enabled status: {str(e)}")

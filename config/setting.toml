@@ -21,6 +21,7 @@ log_responses = true
 mask_token = true
 
 [cache]
+enabled = false
 timeout = 600
 base_url = "http://127.0.0.1:8000"
 
@@ -43,6 +44,9 @@ custom_parse_token = ""
 
 [video_length]
 default_length = "10s"
+
+[token_refresh]
+at_auto_refresh_enabled = false
 
 [video_length.lengths]
 10s = 300

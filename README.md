@@ -157,12 +157,12 @@ python main.py
 
 | 模型 | 说明 | 输入 | 输出 |
 |------|------|------|------|
-| `sora-image` | 文生图（默认横屏） | 文本 | 图片 |
-| `sora-image-landscape` | 文生图（横屏） | 文本 | 图片 |
-| `sora-image-portrait` | 文生图（竖屏） | 文本 | 图片 |
-| `sora-video` | 文生视频（默认横屏） | 文本 | 视频 |
-| `sora-video-landscape` | 文生视频（横屏） | 文本 | 视频 |
-| `sora-video-portrait` | 文生视频（竖屏） | 文本 | 视频 |
+| `sora-image` | 文生图（默认横屏） | 文本/图片 | 图片 |
+| `sora-image-landscape` | 文生图（横屏） | 文本/图片 | 图片 |
+| `sora-image-portrait` | 文生图（竖屏） | 文本/图片 | 图片 |
+| `sora-video` | 文生视频（默认横屏） | 文本/图片 | 视频 |
+| `sora-video-landscape` | 文生视频（横屏） | 文本/图片 | 视频 |
+| `sora-video-portrait` | 文生视频（竖屏） | 文本/图片 | 视频 |
 
 #### 请求示例
 

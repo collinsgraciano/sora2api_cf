@@ -229,6 +229,8 @@ class GenerationHandler:
         start_time = time.time()
         last_heartbeat_time = start_time  # Track last heartbeat for image generation
         heartbeat_interval = 10  # Send heartbeat every 10 seconds for image generation
+        last_status_output_time = start_time  # Track last status output time for video generation
+        video_status_interval = 30  # Output status every 30 seconds for video generation
 
         debug_logger.log_info(f"Starting task polling: task_id={task_id}, is_video={is_video}, timeout={timeout}s, max_attempts={max_attempts}")
 
@@ -275,16 +277,18 @@ class GenerationHandler:
                             else:
                                 progress_pct = int(progress_pct * 100)
 
-                            # Only yield progress update if it changed
-                            if progress_pct != last_progress:
-                                last_progress = progress_pct
-                                status = task.get("status", "processing")
-                                debug_logger.log_info(f"Task {task_id} progress: {progress_pct}% (status: {status})")
+                            # Update last_progress for tracking
+                            last_progress = progress_pct
+                            status = task.get("status", "processing")
 
-                                if stream:
-                                    yield self._format_stream_chunk(
-                                        reasoning_content=f"**Video Generation Progress**: {progress_pct}% ({status})\n"
-                                    )
+                            # Output status every 30 seconds (not just when progress changes)
+                            current_time = time.time()
+                            if stream and (current_time - last_status_output_time >= video_status_interval):
+                                last_status_output_time = current_time
+                                debug_logger.log_info(f"Task {task_id} progress: {progress_pct}% (status: {status})")
+                                yield self._format_stream_chunk(
+                                    reasoning_content=f"**Video Generation Progress**: {progress_pct}% ({status})\n"
+                                )
                             break
 
                     # If task not found in pending tasks, it's completed - fetch from drafts
@@ -356,43 +360,51 @@ class GenerationHandler:
 
                                         if stream:
                                             yield self._format_stream_chunk(
-                                                reasoning_content=f"Video published successfully. Post ID: {post_id}\nNow caching watermark-free video...\n"
+                                                reasoning_content=f"Video published successfully. Post ID: {post_id}\nNow {'caching' if config.cache_enabled else 'preparing'} watermark-free video...\n"
                                             )
 
-                                        # Cache watermark-free video
-                                        try:
-                                            cached_filename = await self.file_cache.download_and_cache(watermark_free_url, "video")
-                                            local_url = f"{self._get_base_url()}/tmp/{cached_filename}"
-                                            if stream:
-                                                yield self._format_stream_chunk(
-                                                    reasoning_content="Watermark-free video cached successfully. Preparing final response...\n"
-                                                )
-
-                                            # Delete the published post after caching
+                                        # Cache watermark-free video (if cache enabled)
+                                        if config.cache_enabled:
                                             try:
-                                                debug_logger.log_info(f"Deleting published post: {post_id}")
-                                                await self.sora_client.delete_post(post_id, token)
-                                                debug_logger.log_info(f"Published post deleted successfully: {post_id}")
+                                                cached_filename = await self.file_cache.download_and_cache(watermark_free_url, "video")
+                                                local_url = f"{self._get_base_url()}/tmp/{cached_filename}"
                                                 if stream:
                                                     yield self._format_stream_chunk(
-                                                        reasoning_content="Published post deleted successfully.\n"
+                                                        reasoning_content="Watermark-free video cached successfully. Preparing final response...\n"
                                                     )
-                                            except Exception as delete_error:
-                                                debug_logger.log_error(
-                                                    error_message=f"Failed to delete published post {post_id}: {str(delete_error)}",
-                                                    status_code=500,
-                                                    response_text=str(delete_error)
-                                                )
+
+                                                # Delete the published post after caching
+                                                try:
+                                                    debug_logger.log_info(f"Deleting published post: {post_id}")
+                                                    await self.sora_client.delete_post(post_id, token)
+                                                    debug_logger.log_info(f"Published post deleted successfully: {post_id}")
+                                                    if stream:
+                                                        yield self._format_stream_chunk(
+                                                            reasoning_content="Published post deleted successfully.\n"
+                                                        )
+                                                except Exception as delete_error:
+                                                    debug_logger.log_error(
+                                                        error_message=f"Failed to delete published post {post_id}: {str(delete_error)}",
+                                                        status_code=500,
+                                                        response_text=str(delete_error)
+                                                    )
+                                                    if stream:
+                                                        yield self._format_stream_chunk(
+                                                            reasoning_content=f"Warning: Failed to delete published post - {str(delete_error)}\n"
+                                                        )
+                                            except Exception as cache_error:
+                                                # Fallback to watermark-free URL if caching fails
+                                                local_url = watermark_free_url
                                                 if stream:
                                                     yield self._format_stream_chunk(
-                                                        reasoning_content=f"Warning: Failed to delete published post - {str(delete_error)}\n"
+                                                        reasoning_content=f"Warning: Failed to cache file - {str(cache_error)}\nUsing original watermark-free URL instead...\n"
                                                     )
-                                        except Exception as cache_error:
-                                            # Fallback to watermark-free URL if caching fails
+                                        else:
+                                            # Cache disabled: use watermark-free URL directly
                                             local_url = watermark_free_url
                                             if stream:
                                                 yield self._format_stream_chunk(
-                                                    reasoning_content=f"Warning: Failed to cache file - {str(cache_error)}\nUsing original watermark-free URL instead...\n"
+                                                    reasoning_content="Cache is disabled. Using watermark-free URL directly...\n"
                                                 )
 
                                     except Exception as publish_error:
@@ -410,34 +422,45 @@ class GenerationHandler:
                                         url = item.get("downloadable_url") or item.get("url")
                                         if not url:
                                             raise Exception("Video URL not found")
-                                        try:
-                                            cached_filename = await self.file_cache.download_and_cache(url, "video")
-                                            local_url = f"{self._get_base_url()}/tmp/{cached_filename}"
-                                        except Exception as cache_error:
+                                        if config.cache_enabled:
+                                            try:
+                                                cached_filename = await self.file_cache.download_and_cache(url, "video")
+                                                local_url = f"{self._get_base_url()}/tmp/{cached_filename}"
+                                            except Exception as cache_error:
+                                                local_url = url
+                                        else:
                                             local_url = url
                                 else:
                                     # Normal mode: use downloadable_url instead of url
                                     url = item.get("downloadable_url") or item.get("url")
                                     if url:
-                                        # Cache video file
-                                        if stream:
-                                            yield self._format_stream_chunk(
-                                                reasoning_content="**Video Generation Completed**\n\nVideo generation successful. Now caching the video file...\n"
-                                            )
-
-                                        try:
-                                            cached_filename = await self.file_cache.download_and_cache(url, "video")
-                                            local_url = f"{self._get_base_url()}/tmp/{cached_filename}"
+                                        # Cache video file (if cache enabled)
+                                        if config.cache_enabled:
                                             if stream:
                                                 yield self._format_stream_chunk(
-                                                    reasoning_content="Video file cached successfully. Preparing final response...\n"
+                                                    reasoning_content="**Video Generation Completed**\n\nVideo generation successful. Now caching the video file...\n"
                                                 )
-                                        except Exception as cache_error:
-                                            # Fallback to original URL if caching fails
+
+                                            try:
+                                                cached_filename = await self.file_cache.download_and_cache(url, "video")
+                                                local_url = f"{self._get_base_url()}/tmp/{cached_filename}"
+                                                if stream:
+                                                    yield self._format_stream_chunk(
+                                                        reasoning_content="Video file cached successfully. Preparing final response...\n"
+                                                    )
+                                            except Exception as cache_error:
+                                                # Fallback to original URL if caching fails
+                                                local_url = url
+                                                if stream:
+                                                    yield self._format_stream_chunk(
+                                                        reasoning_content=f"Warning: Failed to cache file - {str(cache_error)}\nUsing original URL instead...\n"
+                                                    )
+                                        else:
+                                            # Cache disabled: use original URL directly
                                             local_url = url
                                             if stream:
                                                 yield self._format_stream_chunk(
-                                                    reasoning_content=f"Warning: Failed to cache file - {str(cache_error)}\nUsing original URL instead...\n"
+                                                    reasoning_content="**Video Generation Completed**\n\nCache is disabled. Using original URL directly...\n"
                                                 )
 
                                 # Task completed
@@ -482,27 +505,37 @@ class GenerationHandler:
 
                                     base_url = self._get_base_url()
                                     local_urls = []
-                                    for idx, url in enumerate(urls):
-                                        try:
-                                            cached_filename = await self.file_cache.download_and_cache(url, "image")
-                                            local_url = f"{base_url}/tmp/{cached_filename}"
-                                            local_urls.append(local_url)
-                                            if stream and len(urls) > 1:
-                                                yield self._format_stream_chunk(
-                                                    reasoning_content=f"Cached image {idx + 1}/{len(urls)}...\n"
-                                                )
-                                        except Exception as cache_error:
-                                            # Fallback to original URL if caching fails
-                                            local_urls.append(url)
-                                            if stream:
-                                                yield self._format_stream_chunk(
-                                                    reasoning_content=f"Warning: Failed to cache image {idx + 1} - {str(cache_error)}\nUsing original URL instead...\n"
-                                                )
 
-                                    if stream and all(u.startswith(base_url) for u in local_urls):
-                                        yield self._format_stream_chunk(
-                                            reasoning_content="All images cached successfully. Preparing final response...\n"
-                                        )
+                                    # Check if cache is enabled
+                                    if config.cache_enabled:
+                                        for idx, url in enumerate(urls):
+                                            try:
+                                                cached_filename = await self.file_cache.download_and_cache(url, "image")
+                                                local_url = f"{base_url}/tmp/{cached_filename}"
+                                                local_urls.append(local_url)
+                                                if stream and len(urls) > 1:
+                                                    yield self._format_stream_chunk(
+                                                        reasoning_content=f"Cached image {idx + 1}/{len(urls)}...\n"
+                                                    )
+                                            except Exception as cache_error:
+                                                # Fallback to original URL if caching fails
+                                                local_urls.append(url)
+                                                if stream:
+                                                    yield self._format_stream_chunk(
+                                                        reasoning_content=f"Warning: Failed to cache image {idx + 1} - {str(cache_error)}\nUsing original URL instead...\n"
+                                                    )
+
+                                        if stream and all(u.startswith(base_url) for u in local_urls):
+                                            yield self._format_stream_chunk(
+                                                reasoning_content="All images cached successfully. Preparing final response...\n"
+                                            )
+                                    else:
+                                        # Cache disabled: use original URLs directly
+                                        local_urls = urls
+                                        if stream:
+                                            yield self._format_stream_chunk(
+                                                reasoning_content="Cache is disabled. Using original URLs directly...\n"
+                                            )
 
                                     await self.db.update_task(
                                         task_id, "completed", 100.0,
@@ -510,10 +543,10 @@ class GenerationHandler:
                                     )
 
                                     if stream:
-                                        # Final response with content
-                                        content_html = "".join([f"<img src='{url}' />" for url in local_urls])
+                                        # Final response with content (Markdown format)
+                                        content_markdown = "\n".join([f"![Generated Image]({url})" for url in local_urls])
                                         yield self._format_stream_chunk(
-                                            content=content_html,
+                                            content=content_markdown,
                                             finish_reason="STOP"
                                         )
                                         yield "data: [DONE]\n\n"
@@ -544,7 +577,7 @@ class GenerationHandler:
                             last_heartbeat_time = current_time
                             elapsed = int(current_time - start_time)
                             yield self._format_stream_chunk(
-                                reasoning_content=f"**Generating**\n\nImage generation in progress... ({elapsed}s elapsed)\n"
+                                reasoning_content=f"Image generation in progress... ({elapsed}s elapsed)\n"
                             )
 
                     # If task not found in response, send heartbeat for image generation
@@ -554,7 +587,7 @@ class GenerationHandler:
                             last_heartbeat_time = current_time
                             elapsed = int(current_time - start_time)
                             yield self._format_stream_chunk(
-                                reasoning_content=f"**Generating**\n\nImage generation in progress... ({elapsed}s elapsed)\n"
+                                reasoning_content=f"Image generation in progress... ({elapsed}s elapsed)\n"
                             )
 
                 # Progress update for stream mode (fallback if no status from API)
@@ -638,7 +671,7 @@ class GenerationHandler:
         if media_type == "video":
             content = f"```html\n<video src='{url}' controls></video>\n```"
         else:
-            content = f"<img src='{url}' />"
+            content = f"![Generated Image]({url})"
 
         response = {
             "id": f"chatcmpl-{datetime.now().timestamp()}",

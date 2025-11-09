@@ -121,6 +121,17 @@ class Config:
         self._config["cache"]["base_url"] = base_url
 
     @property
+    def cache_enabled(self) -> bool:
+        """Get cache enabled status"""
+        return self._config.get("cache", {}).get("enabled", True)
+
+    def set_cache_enabled(self, enabled: bool):
+        """Set cache enabled status"""
+        if "cache" not in self._config:
+            self._config["cache"] = {}
+        self._config["cache"]["enabled"] = enabled
+
+    @property
     def image_timeout(self) -> int:
         """Get image generation timeout in seconds"""
         return self._config.get("generation", {}).get("image_timeout", 300)
@@ -167,6 +178,17 @@ class Config:
     def watermark_free_custom_token(self) -> str:
         """Get custom parse server access token"""
         return self._config.get("watermark_free", {}).get("custom_parse_token", "")
+
+    @property
+    def at_auto_refresh_enabled(self) -> bool:
+        """Get AT auto refresh enabled status"""
+        return self._config.get("token_refresh", {}).get("at_auto_refresh_enabled", False)
+
+    def set_at_auto_refresh_enabled(self, enabled: bool):
+        """Set AT auto refresh enabled/disabled"""
+        if "token_refresh" not in self._config:
+            self._config["token_refresh"] = {}
+        self._config["token_refresh"]["at_auto_refresh_enabled"] = enabled
 
 # Global config instance
 config = Config()

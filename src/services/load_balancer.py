@@ -25,6 +25,18 @@ class LoadBalancer:
         Returns:
             Selected token or None if no available tokens
         """
+        # Try to auto-refresh tokens expiring within 24 hours if enabled
+        if config.at_auto_refresh_enabled:
+            all_tokens = await self.token_manager.get_all_tokens()
+            for token in all_tokens:
+                if token.is_active and token.expiry_time:
+                    from datetime import datetime
+                    time_until_expiry = token.expiry_time - datetime.now()
+                    hours_until_expiry = time_until_expiry.total_seconds() / 3600
+                    # Refresh if expiry is within 24 hours
+                    if hours_until_expiry <= 24:
+                        await self.token_manager.auto_refresh_expiring_token(token.id)
+
         active_tokens = await self.token_manager.get_active_tokens()
 
         if not active_tokens:
