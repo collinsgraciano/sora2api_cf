@@ -4,7 +4,7 @@ import json
 from datetime import datetime
 from typing import Optional, List
 from pathlib import Path
-from .models import Token, TokenStats, Task, RequestLog, AdminConfig, ProxyConfig, WatermarkFreeConfig, CacheConfig, GenerationConfig, TokenRefreshConfig
+from .models import Token, TokenStats, Task, RequestLog, AdminConfig, ProxyConfig, WatermarkFreeConfig, CacheConfig, GenerationConfig, TokenRefreshConfig, CFWorkerConfig
 
 class Database:
     """SQLite database manager"""
@@ -139,22 +139,25 @@ class Database:
             """, (cache_enabled, cache_timeout, cache_base_url))
 
         # Ensure generation_config has a row
-        cursor = await db.execute("SELECT COUNT(*) FROM generation_config")
-        count = await cursor.fetchone()
-        if count[0] == 0:
-            # Get generation config from config_dict if provided, otherwise use defaults
-            image_timeout = 300
-            video_timeout = 3000
+        if await self._table_exists(db, "generation_config"):
+            cursor = await db.execute("SELECT COUNT(*) FROM generation_config")
+            count = await cursor.fetchone()
+            if count[0] == 0:
+                # Get generation config from config_dict if provided, otherwise using defaults
+                image_timeout = 300
+                video_timeout = 3000
+                poll_interval = 5.0
+                
+                if config_dict:
+                    gen_config = config_dict.get("generation", {})
+                    image_timeout = gen_config.get("image_timeout", 300)
+                    video_timeout = gen_config.get("video_timeout", 3000)
+                    poll_interval = config_dict.get("sora", {}).get("poll_interval", 5.0)
 
-            if config_dict:
-                generation_config = config_dict.get("generation", {})
-                image_timeout = generation_config.get("image_timeout", 300)
-                video_timeout = generation_config.get("video_timeout", 3000)
-
-            await db.execute("""
-                INSERT INTO generation_config (id, image_timeout, video_timeout)
-                VALUES (1, ?, ?)
-            """, (image_timeout, video_timeout))
+                await db.execute("""
+                    INSERT INTO generation_config (id, image_timeout, video_timeout, poll_interval)
+                    VALUES (1, ?, ?, ?)
+                """, (image_timeout, video_timeout, poll_interval))
 
         # Ensure token_refresh_config has a row
         cursor = await db.execute("SELECT COUNT(*) FROM token_refresh_config")
@@ -171,6 +174,27 @@ class Database:
                 INSERT INTO token_refresh_config (id, at_auto_refresh_enabled)
                 VALUES (1, ?)
             """, (at_auto_refresh_enabled,))
+
+        # Ensure cf_worker_config has a row
+        if await self._table_exists(db, "cf_worker_config"):
+            cursor = await db.execute("SELECT COUNT(*) FROM cf_worker_config")
+            count = await cursor.fetchone()
+            if count[0] == 0:
+                # Get CF Worker config from config_dict if provided, otherwise use defaults
+                cf_worker_enabled = False
+                cf_worker_url = None
+
+                if config_dict:
+                    cf_worker_config = config_dict.get("cf_worker_upload", {})
+                    cf_worker_enabled = cf_worker_config.get("enabled", False)
+                    cf_worker_url = cf_worker_config.get("worker_url", "")
+                    # Convert empty string to None
+                    cf_worker_url = cf_worker_url if cf_worker_url else None
+
+                await db.execute("""
+                    INSERT INTO cf_worker_config (id, cf_worker_enabled, cf_worker_url)
+                    VALUES (1, ?, ?)
+                """, (cf_worker_enabled, cf_worker_url))
 
 
     async def check_and_migrate_db(self, config_dict: dict = None):
@@ -236,6 +260,20 @@ class Database:
                         try:
                             await db.execute(f"ALTER TABLE admin_config ADD COLUMN {col_name} {col_type}")
                             print(f"  ✓ Added column '{col_name}' to admin_config table")
+                        except Exception as e:
+                            print(f"  ✗ Failed to add column '{col_name}': {e}")
+            
+            # Check and add missing columns to generation_config table
+            if await self._table_exists(db, "generation_config"):
+                columns_to_add = [
+                    ("poll_interval", "REAL DEFAULT 5.0"),
+                ]
+
+                for col_name, col_type in columns_to_add:
+                    if not await self._column_exists(db, "generation_config", col_name):
+                        try:
+                            await db.execute(f"ALTER TABLE generation_config ADD COLUMN {col_name} {col_type}")
+                            print(f"  ✓ Added column '{col_name}' to generation_config table")
                         except Exception as e:
                             print(f"  ✗ Failed to add column '{col_name}': {e}")
 
@@ -423,6 +461,7 @@ class Database:
                     id INTEGER PRIMARY KEY DEFAULT 1,
                     image_timeout INTEGER DEFAULT 300,
                     video_timeout INTEGER DEFAULT 3000,
+                    poll_interval REAL DEFAULT 5.0,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
@@ -433,6 +472,17 @@ class Database:
                 CREATE TABLE IF NOT EXISTS token_refresh_config (
                     id INTEGER PRIMARY KEY DEFAULT 1,
                     at_auto_refresh_enabled BOOLEAN DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+            # CF Worker config table
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS cf_worker_config (
+                    id INTEGER PRIMARY KEY DEFAULT 1,
+                    cf_worker_enabled BOOLEAN DEFAULT 0,
+                    cf_worker_url TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
@@ -1094,7 +1144,8 @@ class Database:
             # This should not happen in normal operation as _ensure_config_rows should create it
             return GenerationConfig(image_timeout=300, video_timeout=3000)
 
-    async def update_generation_config(self, image_timeout: int = None, video_timeout: int = None):
+
+    async def update_generation_config(self, image_timeout: int = None, video_timeout: int = None, poll_interval: float = None):
         """Update generation configuration"""
         async with aiosqlite.connect(self.db_path) as db:
             # Get current config first
@@ -1107,15 +1158,17 @@ class Database:
                 # Update only provided fields
                 new_image_timeout = image_timeout if image_timeout is not None else current.get("image_timeout", 300)
                 new_video_timeout = video_timeout if video_timeout is not None else current.get("video_timeout", 3000)
+                new_poll_interval = poll_interval if poll_interval is not None else current.get("poll_interval", 5.0)
             else:
                 new_image_timeout = image_timeout if image_timeout is not None else 300
                 new_video_timeout = video_timeout if video_timeout is not None else 3000
+                new_poll_interval = poll_interval if poll_interval is not None else 5.0
 
             await db.execute("""
                 UPDATE generation_config
-                SET image_timeout = ?, video_timeout = ?, updated_at = CURRENT_TIMESTAMP
+                SET image_timeout = ?, video_timeout = ?, poll_interval = ?, updated_at = CURRENT_TIMESTAMP
                 WHERE id = 1
-            """, (new_image_timeout, new_video_timeout))
+            """, (new_image_timeout, new_video_timeout, new_poll_interval))
             await db.commit()
 
     # Token refresh config operations
@@ -1141,3 +1194,24 @@ class Database:
             """, (at_auto_refresh_enabled,))
             await db.commit()
 
+    # CF Worker config operations
+    async def get_cf_worker_config(self) -> CFWorkerConfig:
+        """Get CF Worker proxy configuration"""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("SELECT * FROM cf_worker_config WHERE id = 1")
+            row = await cursor.fetchone()
+            if row:
+                return CFWorkerConfig(**dict(row))
+            # If no row exists, return a default config
+            return CFWorkerConfig(cf_worker_enabled=False, cf_worker_url=None)
+
+    async def update_cf_worker_config(self, enabled: bool, worker_url: str = None):
+        """Update CF Worker proxy configuration"""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("""
+                UPDATE cf_worker_config
+                SET cf_worker_enabled = ?, cf_worker_url = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = 1
+            """, (enabled, worker_url))
+            await db.commit()

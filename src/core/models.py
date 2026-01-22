@@ -123,6 +123,7 @@ class GenerationConfig(BaseModel):
     id: int = 1
     image_timeout: int  # Read from database, initialized from setting.toml on first startup
     video_timeout: int  # Read from database, initialized from setting.toml on first startup
+    poll_interval: float  # Read from database, initialized from setting.toml on first startup
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -130,6 +131,14 @@ class TokenRefreshConfig(BaseModel):
     """Token refresh configuration"""
     id: int = 1
     at_auto_refresh_enabled: bool  # Read from database, initialized from setting.toml on first startup
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+class CFWorkerConfig(BaseModel):
+    """CF Worker proxy configuration"""
+    id: int = 1
+    cf_worker_enabled: bool = False  # Read from database, initialized from setting.toml on first startup
+    cf_worker_url: Optional[str] = None  # Read from database, initialized from setting.toml on first startup
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 

@@ -142,6 +142,7 @@ class UpdateCacheBaseUrlRequest(BaseModel):
 class UpdateGenerationTimeoutRequest(BaseModel):
     image_timeout: Optional[int] = None  # Image generation timeout in seconds
     video_timeout: Optional[int] = None  # Video generation timeout in seconds
+    poll_interval: Optional[float] = None  # Polling interval in seconds
 
 class UpdateWatermarkFreeConfigRequest(BaseModel):
     watermark_free_enabled: bool
@@ -1016,7 +1017,8 @@ async def get_generation_timeout(token: str = Depends(verify_admin_token)):
         "success": True,
         "config": {
             "image_timeout": config.image_timeout,
-            "video_timeout": config.video_timeout
+            "video_timeout": config.video_timeout,
+            "poll_interval": config.poll_interval
         }
     }
 
@@ -1040,16 +1042,25 @@ async def update_generation_timeout(
             if request.video_timeout > 7200:
                 raise HTTPException(status_code=400, detail="Video timeout cannot exceed 2 hours (7200 seconds)")
 
+        if request.poll_interval is not None:
+            if request.poll_interval < 3:
+                raise HTTPException(status_code=400, detail="Poll interval must be at least 3 seconds")
+            if request.poll_interval > 100:
+                raise HTTPException(status_code=400, detail="Poll interval cannot exceed 100 seconds")
+
         # Update in-memory config
         if request.image_timeout is not None:
             config.set_image_timeout(request.image_timeout)
         if request.video_timeout is not None:
             config.set_video_timeout(request.video_timeout)
+        if request.poll_interval is not None:
+            config.set_poll_interval(request.poll_interval)
 
         # Update database
         await db.update_generation_config(
             image_timeout=request.image_timeout,
-            video_timeout=request.video_timeout
+            video_timeout=request.video_timeout,
+            poll_interval=request.poll_interval
         )
 
         # Update TokenLock timeout if image timeout was changed
@@ -1058,16 +1069,17 @@ async def update_generation_timeout(
 
         return {
             "success": True,
-            "message": "Generation timeout configuration updated",
+            "message": "Generation configuration updated",
             "config": {
                 "image_timeout": config.image_timeout,
-                "video_timeout": config.video_timeout
+                "video_timeout": config.video_timeout,
+                "poll_interval": config.poll_interval
             }
         }
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to update generation timeout: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to update generation configuration: {str(e)}")
 
 # AT auto refresh config endpoints
 @router.get("/api/token-refresh/config")
@@ -1172,3 +1184,60 @@ async def download_debug_logs(token: str = Depends(verify_admin_token)):
         filename="logs.txt",
         media_type="text/plain"
     )
+
+# CF Worker upload proxy config endpoints
+class UpdateCFWorkerUploadConfigRequest(BaseModel):
+    enabled: bool
+    worker_url: Optional[str] = None
+
+@router.get("/api/cf-worker-upload/config")
+async def get_cf_worker_upload_config(token: str = Depends(verify_admin_token)):
+    """Get CF Worker upload proxy configuration"""
+    return {
+        "success": True,
+        "config": {
+            "enabled": config.cf_worker_upload_enabled,
+            "worker_url": config.cf_worker_upload_url
+        }
+    }
+
+@router.post("/api/cf-worker-upload/config")
+async def update_cf_worker_upload_config(
+    request: UpdateCFWorkerUploadConfigRequest,
+    token: str = Depends(verify_admin_token)
+):
+    """Update CF Worker upload proxy configuration"""
+    try:
+        # Validate worker_url if enabled
+        if request.enabled and request.worker_url:
+            worker_url = request.worker_url.strip()
+            if not (worker_url.startswith("http://") or worker_url.startswith("https://")):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Worker URL 必须以 http:// 或 https:// 开头"
+                )
+            # Remove trailing slash
+            worker_url = worker_url.rstrip('/')
+        else:
+            worker_url = request.worker_url.strip() if request.worker_url else ""
+
+        # Update in-memory config
+        config.set_cf_worker_upload_enabled(request.enabled)
+        config.set_cf_worker_upload_url(worker_url)
+
+        # Persist to database
+        await db.update_cf_worker_config(request.enabled, worker_url if worker_url else None)
+
+        return {
+            "success": True,
+            "message": f"CF Worker 上传代理{'已启用' if request.enabled else '已禁用'}",
+            "config": {
+                "enabled": request.enabled,
+                "worker_url": worker_url
+            }
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"更新 CF Worker 配置失败: {str(e)}")
+

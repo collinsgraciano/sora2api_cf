@@ -769,6 +769,10 @@ class GenerationHandler:
                 raise Exception(f"Upstream API timeout: Generation exceeded {timeout} seconds limit")
 
 
+            # Update poll_interval from config dynamically
+            poll_interval = config.poll_interval
+            debug_logger.log_info(f"Polling with interval: {poll_interval}s")
+            
             await asyncio.sleep(poll_interval)
 
             try:
@@ -1619,7 +1623,7 @@ class GenerationHandler:
             yield self._format_stream_chunk(
                 reasoning_content="Processing video to extract character...\n"
             )
-            cameo_status = await self._poll_cameo_status(cameo_id, token_obj.token)
+            cameo_status = await self._poll_cameo_status(cameo_id, token_obj.token, poll_interval=config.poll_interval)
             debug_logger.log_info(f"Cameo status: {cameo_status}")
 
             # Extract character info immediately after polling completes

@@ -131,13 +131,20 @@ async def startup_event():
     generation_handler.file_cache.set_timeout(cache_config.cache_timeout)
 
     # Load generation configuration from database
-    generation_config = await db.get_generation_config()
-    config.set_image_timeout(generation_config.image_timeout)
-    config.set_video_timeout(generation_config.video_timeout)
+    # Load generation config
+    gen_config = await db.get_generation_config()
+    config.set_image_timeout(gen_config.image_timeout)
+    config.set_video_timeout(gen_config.video_timeout)
+    config.set_poll_interval(gen_config.poll_interval)
 
     # Load token refresh configuration from database
     token_refresh_config = await db.get_token_refresh_config()
     config.set_at_auto_refresh_enabled(token_refresh_config.at_auto_refresh_enabled)
+
+    # Load CF Worker proxy configuration from database
+    cf_worker_config = await db.get_cf_worker_config()
+    config.set_cf_worker_upload_enabled(cf_worker_config.cf_worker_enabled)
+    config.set_cf_worker_upload_url(cf_worker_config.cf_worker_url or "")
 
     # Initialize concurrency manager with all tokens
     all_tokens = await db.get_all_tokens()
@@ -173,5 +180,5 @@ if __name__ == "__main__":
         "src.main:app",
         host=config.server_host,
         port=config.server_port,
-        reload=False
+        reload=True
     )

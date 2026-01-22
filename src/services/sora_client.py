@@ -205,6 +205,8 @@ class SoraClient:
 
     async def _nf_create_urllib(self, token: str, payload: dict, sentinel_token: str,
                                 proxy_url: Optional[str], token_id: Optional[int] = None) -> Dict[str, Any]:
+        from ..core.config import config as app_config
+
         url = f"{self.base_url}/nf/create"
         user_agent = random.choice(MOBILE_USER_AGENTS)
 
@@ -216,6 +218,35 @@ class SoraClient:
             "Origin": "https://sora.chatgpt.com",
             "Referer": "https://sora.chatgpt.com/",
         }
+
+        # CF Worker Proxy Logic
+        if app_config.cf_worker_upload_enabled and app_config.cf_worker_upload_url:
+            worker_url = app_config.cf_worker_upload_url.rstrip('/')
+            debug_logger.log_info(f"Using CF Worker proxy for _nf_create_urllib via {worker_url}")
+            
+            # Construct proxy payload conforming to cf-worker-proxy.js protocol
+            # Worker expects: { method, url, headers, body }
+            proxy_payload = {
+                "method": "POST",
+                "url": url,  # The original target URL (.../nf/create)
+                "headers": headers,
+                "body": payload
+            }
+            
+            # Swap payload to proxy payload
+            payload = proxy_payload
+            
+            # Update target URL to Worker URL
+            url = f"{worker_url}/proxy"
+            
+            # Headers for the request TO the Worker (not the forwarded headers)
+            headers = {
+                "Content-Type": "application/json",
+                "User-Agent": user_agent
+            }
+            
+            # DISABLE local proxy when using CF Worker
+            proxy_url = None
 
         try:
             result = await asyncio.to_thread(
@@ -347,6 +378,31 @@ class SoraClient:
             add_sentinel_token: Whether to add openai-sentinel-token header (only for generation requests)
             token_id: Token ID for getting token-specific proxy (optional)
         """
+        from ..core.config import config as app_config
+        
+        # DEBUG LOG
+        #print(f"DEBUG: Checking CF Worker proxy. Enabled: {app_config.cf_worker_upload_enabled}, URL: {app_config.cf_worker_upload_url}, Multipart: {bool(multipart)}")
+        
+        # 如果启用了 CF Worker 代理且不是 multipart 请求，使用 CF Worker 转发
+        if app_config.cf_worker_upload_enabled and app_config.cf_worker_upload_url and not multipart:
+            #print("DEBUG: Using CF Worker proxy for request")
+            return await self._make_request_via_cf_worker(
+                method, endpoint, token, json_data, add_sentinel_token, token_id
+            )
+
+            #print("DEBUG: Using direct request")
+        
+        # 原始直接请求逻辑
+        return await self._make_request_direct(
+            method, endpoint, token, json_data, multipart, add_sentinel_token, token_id
+        )
+
+    async def _make_request_direct(self, method: str, endpoint: str, token: str,
+                                   json_data: Optional[Dict] = None,
+                                   multipart: Optional[Dict] = None,
+                                   add_sentinel_token: bool = False,
+                                   token_id: Optional[int] = None) -> Dict[str, Any]:
+        """直接发送请求到 Sora API（原始逻辑）"""
         proxy_url = await self.proxy_manager.get_proxy_url(token_id)
 
         headers = {
@@ -451,6 +507,112 @@ class SoraClient:
                 raise Exception(error_msg)
 
             return response_json if response_json else response.json()
+
+    async def _make_request_via_cf_worker(self, method: str, endpoint: str, token: str,
+                                          json_data: Optional[Dict] = None,
+                                          add_sentinel_token: bool = False,
+                                          token_id: Optional[int] = None) -> Dict[str, Any]:
+        """通过 CF Worker 代理发送请求
+
+        将请求转发到 CF Worker 的 /proxy 端点，由 Worker 转发到 Sora API
+        """
+        from ..core.config import config as app_config
+        
+        worker_url = app_config.cf_worker_upload_url.rstrip('/')
+        target_url = f"{self.base_url}{endpoint}"
+        
+        # 构建请求头
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "User-Agent": "Sora/1.2026.007 (Android 15; 24122RKC7C; build 2600700)",
+            "Content-Type": "application/json"
+        }
+        
+        # 添加 sentinel token（如果需要）
+        if add_sentinel_token:
+            headers["openai-sentinel-token"] = await self._generate_sentinel_token(token)
+        
+        # 构建发送给 CF Worker 的 payload
+        proxy_payload = {
+            "method": method,
+            "url": target_url,
+            "headers": headers,
+            "body": json_data
+        }
+        
+        # 获取代理（用于连接到 CF Worker）
+        # DISABLE local proxy when using CF Worker
+        proxy_url = None
+        # proxy_url = await self.proxy_manager.get_proxy_url(token_id)
+        
+        async with AsyncSession() as session:
+            kwargs = {
+                "json": proxy_payload,
+                "headers": {"Content-Type": "application/json"},
+                "timeout": self.timeout,
+                "impersonate": "chrome"
+            }
+            
+            if proxy_url:
+                kwargs["proxy"] = proxy_url
+            
+            # Log request
+            debug_logger.log_request(
+                method="POST",
+                url=f"{worker_url}/proxy",
+                headers={"Content-Type": "application/json"},
+                body={"method": method, "url": target_url, "body_keys": list(json_data.keys()) if json_data else None},
+                files=None,
+                proxy=proxy_url
+            )
+            
+            # Record start time
+            start_time = time.time()
+            
+            response = await session.post(f"{worker_url}/proxy", **kwargs)
+            
+            # Calculate duration
+            duration_ms = (time.time() - start_time) * 1000
+            
+            # Parse response
+            try:
+                response_json = response.json()
+            except:
+                response_json = None
+            
+            # Log response
+            debug_logger.log_response(
+                status_code=response.status_code,
+                headers=dict(response.headers),
+                body=response_json if response_json else response.text,
+                duration_ms=duration_ms
+            )
+            
+            # Check for CF Worker error
+            if response.status_code not in [200, 201]:
+                # 检查是否是 Worker 返回的错误
+                if response_json and isinstance(response_json, dict):
+                    # 如果 Worker 返回了上游 API 的错误
+                    error_info = response_json.get("error", {})
+                    if isinstance(error_info, dict) and error_info.get("code") == "unsupported_country_code":
+                        import json
+                        error_msg = json.dumps(response_json)
+                        debug_logger.log_error(
+                            error_message=f"Unsupported country (via CF Worker): {error_msg}",
+                            status_code=response.status_code,
+                            response_text=error_msg
+                        )
+                        raise Exception(error_msg)
+                
+                error_msg = f"CF Worker proxy failed: {response.status_code} - {response.text}"
+                debug_logger.log_error(
+                    error_message=error_msg,
+                    status_code=response.status_code,
+                    response_text=response.text
+                )
+                raise Exception(error_msg)
+            
+            return response_json if response_json else response.json()
     
     async def get_user_info(self, token: str) -> Dict[str, Any]:
         """Get user information"""
@@ -458,6 +620,22 @@ class SoraClient:
     
     async def upload_image(self, image_data: bytes, token: str, filename: str = "image.png") -> str:
         """Upload image and return media_id
+
+        支持两种上传方式：
+        1. 直接上传到 Sora API
+        2. 通过 CF Worker 代理上传（启用时）
+        """
+        from ..core.config import config as app_config
+        
+        # 如果启用了 CF Worker 代理
+        if app_config.cf_worker_upload_enabled and app_config.cf_worker_upload_url:
+            return await self._upload_via_cf_worker(image_data, token, filename)
+        
+        # 直接上传
+        return await self._upload_direct(image_data, token, filename)
+
+    async def _upload_direct(self, image_data: bytes, token: str, filename: str = "image.png") -> str:
+        """直接上传图片到 Sora API
 
         使用 CurlMime 对象上传文件（curl_cffi 的正确方式）
         参考：https://curl-cffi.readthedocs.io/en/latest/quick_start.html#uploads
@@ -488,6 +666,85 @@ class SoraClient:
 
         result = await self._make_request("POST", "/uploads", token, multipart=mp)
         return result["id"]
+
+    async def _upload_via_cf_worker(self, image_data: bytes, token: str, filename: str = "image.png") -> str:
+        """通过 CF Worker 代理上传图片
+
+        将图片数据 base64 编码后发送到 CF Worker，由 Worker 转发上传请求到 Sora API
+        """
+        from ..core.config import config as app_config
+        
+        worker_url = app_config.cf_worker_upload_url.rstrip('/')
+        
+        # 将图片转为 base64
+        image_base64 = base64.b64encode(image_data).decode('utf-8')
+        
+        # 构建请求负载
+        payload = {
+            "image_data": image_base64,
+            "filename": filename,
+            "token": token,
+            "target_url": f"{self.base_url}/uploads"
+        }
+        
+        # DISABLE local proxy when using CF Worker
+        proxy_url = None
+        # proxy_url = await self.proxy_manager.get_proxy_url()
+        
+        async with AsyncSession() as session:
+            kwargs = {
+                "json": payload,
+                "headers": {"Content-Type": "application/json"},
+                "timeout": self.timeout,
+                "impersonate": "chrome"
+            }
+            
+            if proxy_url:
+                kwargs["proxy"] = proxy_url
+            
+            # Log request
+            debug_logger.log_request(
+                method="POST",
+                url=f"{worker_url}/upload",
+                headers=kwargs["headers"],
+                body={"filename": filename, "target_url": payload["target_url"], "image_size": len(image_data)},
+                files=None,
+                proxy=proxy_url
+            )
+            
+            # Record start time
+            start_time = time.time()
+            
+            response = await session.post(f"{worker_url}/upload", **kwargs)
+            
+            # Calculate duration
+            duration_ms = (time.time() - start_time) * 1000
+            
+            # Parse response
+            try:
+                response_json = response.json()
+            except:
+                response_json = None
+            
+            # Log response
+            debug_logger.log_response(
+                status_code=response.status_code,
+                headers=dict(response.headers),
+                body=response_json if response_json else response.text,
+                duration_ms=duration_ms
+            )
+            
+            if response.status_code not in [200, 201]:
+                error_msg = f"CF Worker upload failed: {response.status_code} - {response.text}"
+                debug_logger.log_error(
+                    error_message=error_msg,
+                    status_code=response.status_code,
+                    response_text=response.text
+                )
+                raise Exception(error_msg)
+            
+            result = response_json if response_json else response.json()
+            return result["id"]
     
     async def generate_image(self, prompt: str, token: str, width: int = 360,
                             height: int = 360, media_id: Optional[str] = None, token_id: Optional[int] = None) -> str:

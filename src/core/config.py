@@ -53,9 +53,20 @@ class Config:
     def sora_max_retries(self) -> int:
         return self._config["sora"]["max_retries"]
     
+    def set_server_port_from_db(self, port: int):
+        """Set server port from database"""
+        self._config["server"]["port"] = port
+
     @property
     def poll_interval(self) -> float:
-        return self._config["sora"]["poll_interval"]
+        # If poll_interval is set from database (via setter), use it
+        if hasattr(self, '_poll_interval') and self._poll_interval is not None:
+            return self._poll_interval
+        return self._config.get("sora", {}).get("poll_interval", 5.0)
+
+    def set_poll_interval(self, interval: float):
+        """Set polling interval"""
+        self._poll_interval = interval
     
     @property
     def max_poll_attempts(self) -> int:
@@ -207,6 +218,28 @@ class Config:
         if "token_refresh" not in self._config:
             self._config["token_refresh"] = {}
         self._config["token_refresh"]["at_auto_refresh_enabled"] = enabled
+
+    @property
+    def cf_worker_upload_enabled(self) -> bool:
+        """Get CF Worker upload proxy enabled status"""
+        return self._config.get("cf_worker_upload", {}).get("enabled", False)
+
+    def set_cf_worker_upload_enabled(self, enabled: bool):
+        """Set CF Worker upload proxy enabled/disabled"""
+        if "cf_worker_upload" not in self._config:
+            self._config["cf_worker_upload"] = {}
+        self._config["cf_worker_upload"]["enabled"] = enabled
+
+    @property
+    def cf_worker_upload_url(self) -> str:
+        """Get CF Worker upload proxy URL"""
+        return self._config.get("cf_worker_upload", {}).get("worker_url", "")
+
+    def set_cf_worker_upload_url(self, url: str):
+        """Set CF Worker upload proxy URL"""
+        if "cf_worker_upload" not in self._config:
+            self._config["cf_worker_upload"] = {}
+        self._config["cf_worker_upload"]["worker_url"] = url
 
 # Global config instance
 config = Config()

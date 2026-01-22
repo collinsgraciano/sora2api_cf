@@ -44,3 +44,7 @@ custom_parse_token = ""
 
 [token_refresh]
 at_auto_refresh_enabled = false
+
+[cf_worker_upload]
+enabled = false
+worker_url = ""
