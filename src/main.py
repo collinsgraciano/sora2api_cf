@@ -141,10 +141,11 @@ async def startup_event():
     token_refresh_config = await db.get_token_refresh_config()
     config.set_at_auto_refresh_enabled(token_refresh_config.at_auto_refresh_enabled)
 
-    # Load CF Worker proxy configuration from database
-    cf_worker_config = await db.get_cf_worker_config()
-    config.set_cf_worker_upload_enabled(cf_worker_config.cf_worker_enabled)
-    config.set_cf_worker_upload_url(cf_worker_config.cf_worker_url or "")
+    # Load upload proxy configuration from database
+    upload_proxy_config = await db.get_upload_proxy_config()
+    config.set_upload_proxy_mode(upload_proxy_config.proxy_mode)
+    config.set_cf_worker_upload_url(upload_proxy_config.cf_worker_url or "")
+    config.set_supabase_edge_url(upload_proxy_config.supabase_edge_url or "")
 
     # Initialize concurrency manager with all tokens
     all_tokens = await db.get_all_tokens()

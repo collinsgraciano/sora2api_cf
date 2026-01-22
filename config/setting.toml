@@ -45,6 +45,8 @@ custom_parse_token = ""
 [token_refresh]
 at_auto_refresh_enabled = false
 
-[cf_worker_upload]
-enabled = false
-worker_url = ""
+[upload_proxy]
+# 代理模式: off = 禁用, cf_worker = CF Worker, supabase_edge = Supabase Edge
+mode = "off"
+cf_worker_url = ""
+supabase_edge_url = ""

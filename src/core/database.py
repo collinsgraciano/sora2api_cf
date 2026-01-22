@@ -175,26 +175,37 @@ class Database:
                 VALUES (1, ?)
             """, (at_auto_refresh_enabled,))
 
-        # Ensure cf_worker_config has a row
+        # Ensure cf_worker_config has a row (now used as upload_proxy_config)
         if await self._table_exists(db, "cf_worker_config"):
             cursor = await db.execute("SELECT COUNT(*) FROM cf_worker_config")
             count = await cursor.fetchone()
             if count[0] == 0:
-                # Get CF Worker config from config_dict if provided, otherwise use defaults
-                cf_worker_enabled = False
+                # Get upload proxy config from config_dict if provided, otherwise use defaults
+                proxy_mode = "off"
                 cf_worker_url = None
+                supabase_edge_url = None
 
                 if config_dict:
+                    # Try new upload_proxy config first, then fall back to legacy cf_worker_upload
+                    upload_proxy_config = config_dict.get("upload_proxy", {})
                     cf_worker_config = config_dict.get("cf_worker_upload", {})
-                    cf_worker_enabled = cf_worker_config.get("enabled", False)
-                    cf_worker_url = cf_worker_config.get("worker_url", "")
-                    # Convert empty string to None
+                    
+                    proxy_mode = upload_proxy_config.get("mode", "off")
+                    cf_worker_url = upload_proxy_config.get("cf_worker_url", "") or cf_worker_config.get("worker_url", "")
+                    supabase_edge_url = upload_proxy_config.get("supabase_edge_url", "")
+                    
+                    # Legacy compatibility: if legacy enabled is True, set mode to cf_worker
+                    if proxy_mode == "off" and cf_worker_config.get("enabled", False):
+                        proxy_mode = "cf_worker"
+                    
+                    # Convert empty strings to None
                     cf_worker_url = cf_worker_url if cf_worker_url else None
+                    supabase_edge_url = supabase_edge_url if supabase_edge_url else None
 
                 await db.execute("""
-                    INSERT INTO cf_worker_config (id, cf_worker_enabled, cf_worker_url)
-                    VALUES (1, ?, ?)
-                """, (cf_worker_enabled, cf_worker_url))
+                    INSERT INTO cf_worker_config (id, proxy_mode, cf_worker_url, supabase_edge_url)
+                    VALUES (1, ?, ?, ?)
+                """, (proxy_mode, cf_worker_url, supabase_edge_url))
 
 
     async def check_and_migrate_db(self, config_dict: dict = None):
@@ -307,6 +318,31 @@ class Database:
                             print(f"  ✓ Added column '{col_name}' to request_logs table")
                         except Exception as e:
                             print(f"  ✗ Failed to add column '{col_name}': {e}")
+
+            # Check and add missing columns to cf_worker_config table (now upload_proxy_config)
+            if await self._table_exists(db, "cf_worker_config"):
+                columns_to_add = [
+                    ("proxy_mode", "TEXT DEFAULT 'off'"),
+                    ("supabase_edge_url", "TEXT"),
+                ]
+
+                for col_name, col_type in columns_to_add:
+                    if not await self._column_exists(db, "cf_worker_config", col_name):
+                        try:
+                            await db.execute(f"ALTER TABLE cf_worker_config ADD COLUMN {col_name} {col_type}")
+                            print(f"  ✓ Added column '{col_name}' to cf_worker_config table")
+                        except Exception as e:
+                            print(f"  ✗ Failed to add column '{col_name}': {e}")
+
+                # Migrate cf_worker_enabled to proxy_mode if needed
+                if await self._column_exists(db, "cf_worker_config", "cf_worker_enabled"):
+                    cursor = await db.execute("SELECT cf_worker_enabled FROM cf_worker_config WHERE id = 1")
+                    row = await cursor.fetchone()
+                    if row:
+                        enabled = row[0]
+                        if enabled:
+                            await db.execute("UPDATE cf_worker_config SET proxy_mode = 'cf_worker' WHERE id = 1")
+                            print("  ✓ Migrated cf_worker_enabled to proxy_mode='cf_worker'")
 
             # Ensure all config tables have their default rows
             # Pass config_dict if available to initialize from setting.toml
@@ -477,12 +513,13 @@ class Database:
                 )
             """)
 
-            # CF Worker config table
+            # CF Worker config table (now used as upload_proxy_config)
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS cf_worker_config (
                     id INTEGER PRIMARY KEY DEFAULT 1,
-                    cf_worker_enabled BOOLEAN DEFAULT 0,
+                    proxy_mode TEXT DEFAULT 'off',
                     cf_worker_url TEXT,
+                    supabase_edge_url TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
@@ -1194,24 +1231,42 @@ class Database:
             """, (at_auto_refresh_enabled,))
             await db.commit()
 
-    # CF Worker config operations
-    async def get_cf_worker_config(self) -> CFWorkerConfig:
-        """Get CF Worker proxy configuration"""
+    # Upload proxy config operations (CF Worker / Supabase Edge)
+    async def get_upload_proxy_config(self) -> "UploadProxyConfig":
+        """Get upload proxy configuration"""
+        from .models import UploadProxyConfig
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute("SELECT * FROM cf_worker_config WHERE id = 1")
             row = await cursor.fetchone()
             if row:
-                return CFWorkerConfig(**dict(row))
+                row_dict = dict(row)
+                # Handle legacy cf_worker_enabled field
+                if 'cf_worker_enabled' in row_dict and 'proxy_mode' not in row_dict:
+                    row_dict['proxy_mode'] = 'cf_worker' if row_dict.get('cf_worker_enabled') else 'off'
+                return UploadProxyConfig(**row_dict)
             # If no row exists, return a default config
-            return CFWorkerConfig(cf_worker_enabled=False, cf_worker_url=None)
+            return UploadProxyConfig(proxy_mode="off", cf_worker_url=None, supabase_edge_url=None)
 
-    async def update_cf_worker_config(self, enabled: bool, worker_url: str = None):
-        """Update CF Worker proxy configuration"""
+    # Backward compatibility alias
+    async def get_cf_worker_config(self) -> "UploadProxyConfig":
+        """Get CF Worker proxy configuration (alias for get_upload_proxy_config)"""
+        return await self.get_upload_proxy_config()
+
+    async def update_upload_proxy_config(self, mode: str, cf_worker_url: str = None, supabase_edge_url: str = None):
+        """Update upload proxy configuration"""
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute("""
                 UPDATE cf_worker_config
-                SET cf_worker_enabled = ?, cf_worker_url = ?, updated_at = CURRENT_TIMESTAMP
+                SET proxy_mode = ?, cf_worker_url = ?, supabase_edge_url = ?, updated_at = CURRENT_TIMESTAMP
                 WHERE id = 1
-            """, (enabled, worker_url))
+            """, (mode, cf_worker_url, supabase_edge_url))
             await db.commit()
+
+    # Backward compatibility alias
+    async def update_cf_worker_config(self, enabled: bool, worker_url: str = None):
+        """Update CF Worker proxy configuration (backward compatibility)"""
+        mode = "cf_worker" if enabled else "off"
+        # Get current supabase_edge_url to preserve it
+        current = await self.get_upload_proxy_config()
+        await self.update_upload_proxy_config(mode, worker_url, current.supabase_edge_url)

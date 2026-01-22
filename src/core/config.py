@@ -219,27 +219,62 @@ class Config:
             self._config["token_refresh"] = {}
         self._config["token_refresh"]["at_auto_refresh_enabled"] = enabled
 
+    # Upload Proxy configuration
+    @property
+    def upload_proxy_mode(self) -> str:
+        """Get upload proxy mode: off / cf_worker / supabase_edge"""
+        mode = self._config.get("upload_proxy", {}).get("mode", "off")
+        # Backward compatibility: check legacy cf_worker_upload config
+        if mode == "off":
+            legacy_enabled = self._config.get("cf_worker_upload", {}).get("enabled", False)
+            if legacy_enabled:
+                return "cf_worker"
+        return mode
+
+    def set_upload_proxy_mode(self, mode: str):
+        """Set upload proxy mode"""
+        if "upload_proxy" not in self._config:
+            self._config["upload_proxy"] = {}
+        self._config["upload_proxy"]["mode"] = mode
+
     @property
     def cf_worker_upload_enabled(self) -> bool:
-        """Get CF Worker upload proxy enabled status"""
-        return self._config.get("cf_worker_upload", {}).get("enabled", False)
+        """Get CF Worker upload proxy enabled status (backward compatibility)"""
+        return self.upload_proxy_mode == "cf_worker"
 
     def set_cf_worker_upload_enabled(self, enabled: bool):
-        """Set CF Worker upload proxy enabled/disabled"""
-        if "cf_worker_upload" not in self._config:
-            self._config["cf_worker_upload"] = {}
-        self._config["cf_worker_upload"]["enabled"] = enabled
+        """Set CF Worker upload proxy enabled/disabled (backward compatibility)"""
+        if enabled:
+            self.set_upload_proxy_mode("cf_worker")
+        elif self.upload_proxy_mode == "cf_worker":
+            self.set_upload_proxy_mode("off")
 
     @property
     def cf_worker_upload_url(self) -> str:
         """Get CF Worker upload proxy URL"""
-        return self._config.get("cf_worker_upload", {}).get("worker_url", "")
+        url = self._config.get("upload_proxy", {}).get("cf_worker_url", "")
+        # Backward compatibility
+        if not url:
+            url = self._config.get("cf_worker_upload", {}).get("worker_url", "")
+        return url
 
     def set_cf_worker_upload_url(self, url: str):
         """Set CF Worker upload proxy URL"""
-        if "cf_worker_upload" not in self._config:
-            self._config["cf_worker_upload"] = {}
-        self._config["cf_worker_upload"]["worker_url"] = url
+        if "upload_proxy" not in self._config:
+            self._config["upload_proxy"] = {}
+        self._config["upload_proxy"]["cf_worker_url"] = url
+
+    @property
+    def supabase_edge_url(self) -> str:
+        """Get Supabase Edge Function URL"""
+        return self._config.get("upload_proxy", {}).get("supabase_edge_url", "")
+
+    def set_supabase_edge_url(self, url: str):
+        """Set Supabase Edge Function URL"""
+        if "upload_proxy" not in self._config:
+            self._config["upload_proxy"] = {}
+        self._config["upload_proxy"]["supabase_edge_url"] = url
 
 # Global config instance
 config = Config()
+

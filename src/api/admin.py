@@ -1185,19 +1185,28 @@ async def download_debug_logs(token: str = Depends(verify_admin_token)):
         media_type="text/plain"
     )
 
-# CF Worker upload proxy config endpoints
+# Upload proxy config endpoints (CF Worker / Supabase Edge)
+class UpdateUploadProxyConfigRequest(BaseModel):
+    mode: str  # off / cf_worker / supabase_edge
+    cf_worker_url: Optional[str] = None
+    supabase_edge_url: Optional[str] = None
+
+# Keep old request model for backward compatibility
 class UpdateCFWorkerUploadConfigRequest(BaseModel):
     enabled: bool
     worker_url: Optional[str] = None
 
 @router.get("/api/cf-worker-upload/config")
 async def get_cf_worker_upload_config(token: str = Depends(verify_admin_token)):
-    """Get CF Worker upload proxy configuration"""
+    """Get upload proxy configuration (legacy endpoint, also returns new fields)"""
     return {
         "success": True,
         "config": {
-            "enabled": config.cf_worker_upload_enabled,
-            "worker_url": config.cf_worker_upload_url
+            "enabled": config.cf_worker_upload_enabled,  # backward compatibility
+            "worker_url": config.cf_worker_upload_url,    # backward compatibility
+            "mode": config.upload_proxy_mode,
+            "cf_worker_url": config.cf_worker_upload_url,
+            "supabase_edge_url": config.supabase_edge_url
         }
     }
 
@@ -1206,7 +1215,7 @@ async def update_cf_worker_upload_config(
     request: UpdateCFWorkerUploadConfigRequest,
     token: str = Depends(verify_admin_token)
 ):
-    """Update CF Worker upload proxy configuration"""
+    """Update CF Worker upload proxy configuration (legacy endpoint)"""
     try:
         # Validate worker_url if enabled
         if request.enabled and request.worker_url:
@@ -1240,4 +1249,73 @@ async def update_cf_worker_upload_config(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"更新 CF Worker 配置失败: {str(e)}")
+
+@router.get("/api/upload-proxy/config")
+async def get_upload_proxy_config(token: str = Depends(verify_admin_token)):
+    """Get upload proxy configuration"""
+    return {
+        "success": True,
+        "config": {
+            "mode": config.upload_proxy_mode,
+            "cf_worker_url": config.cf_worker_upload_url,
+            "supabase_edge_url": config.supabase_edge_url
+        }
+    }
+
+@router.post("/api/upload-proxy/config")
+async def update_upload_proxy_config(
+    request: UpdateUploadProxyConfigRequest,
+    token: str = Depends(verify_admin_token)
+):
+    """Update upload proxy configuration"""
+    try:
+        mode = request.mode
+        if mode not in ["off", "cf_worker", "supabase_edge"]:
+            raise HTTPException(status_code=400, detail="无效的代理模式，必须是 off / cf_worker / supabase_edge")
+
+        # Validate URLs
+        cf_worker_url = request.cf_worker_url.strip() if request.cf_worker_url else ""
+        supabase_edge_url = request.supabase_edge_url.strip() if request.supabase_edge_url else ""
+
+        if mode == "cf_worker" and cf_worker_url:
+            if not (cf_worker_url.startswith("http://") or cf_worker_url.startswith("https://")):
+                raise HTTPException(status_code=400, detail="CF Worker URL 必须以 http:// 或 https:// 开头")
+            cf_worker_url = cf_worker_url.rstrip('/')
+
+        if mode == "supabase_edge" and supabase_edge_url:
+            if not (supabase_edge_url.startswith("http://") or supabase_edge_url.startswith("https://")):
+                raise HTTPException(status_code=400, detail="Supabase Edge URL 必须以 http:// 或 https:// 开头")
+            supabase_edge_url = supabase_edge_url.rstrip('/')
+
+        # Update in-memory config
+        config.set_upload_proxy_mode(mode)
+        config.set_cf_worker_upload_url(cf_worker_url)
+        config.set_supabase_edge_url(supabase_edge_url)
+
+        # Persist to database
+        await db.update_upload_proxy_config(
+            mode,
+            cf_worker_url if cf_worker_url else None,
+            supabase_edge_url if supabase_edge_url else None
+        )
+
+        mode_messages = {
+            "off": "上传代理已禁用",
+            "cf_worker": "已切换到 CF Worker 代理",
+            "supabase_edge": "已切换到 Supabase Edge 代理"
+        }
+
+        return {
+            "success": True,
+            "message": mode_messages.get(mode, "配置已更新"),
+            "config": {
+                "mode": mode,
+                "cf_worker_url": cf_worker_url,
+                "supabase_edge_url": supabase_edge_url
+            }
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"更新上传代理配置失败: {str(e)}")
 

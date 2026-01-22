@@ -134,13 +134,18 @@ class TokenRefreshConfig(BaseModel):
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
-class CFWorkerConfig(BaseModel):
-    """CF Worker proxy configuration"""
+class UploadProxyConfig(BaseModel):
+    """Upload proxy configuration"""
     id: int = 1
-    cf_worker_enabled: bool = False  # Read from database, initialized from setting.toml on first startup
-    cf_worker_url: Optional[str] = None  # Read from database, initialized from setting.toml on first startup
+    proxy_mode: str = "off"  # off / cf_worker / supabase_edge
+    cf_worker_url: Optional[str] = None  # CF Worker URL
+    supabase_edge_url: Optional[str] = None  # Supabase Edge Function URL
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+
+# Alias for backward compatibility
+CFWorkerConfig = UploadProxyConfig
+
 
 # API Request/Response models
 class ChatMessage(BaseModel):

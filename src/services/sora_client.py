@@ -219,8 +219,9 @@ class SoraClient:
             "Referer": "https://sora.chatgpt.com/",
         }
 
-        # CF Worker Proxy Logic
-        if app_config.cf_worker_upload_enabled and app_config.cf_worker_upload_url:
+        # CF Worker / Supabase Edge Proxy Logic
+        proxy_mode = app_config.upload_proxy_mode
+        if proxy_mode == "cf_worker" and app_config.cf_worker_upload_url:
             worker_url = app_config.cf_worker_upload_url.rstrip('/')
             debug_logger.log_info(f"Using CF Worker proxy for _nf_create_urllib via {worker_url}")
             
@@ -246,6 +247,25 @@ class SoraClient:
             }
             
             # DISABLE local proxy when using CF Worker
+            proxy_url = None
+        elif proxy_mode == "supabase_edge" and app_config.supabase_edge_url:
+            edge_url = app_config.supabase_edge_url.rstrip('/')
+            debug_logger.log_info(f"Using Supabase Edge proxy for _nf_create_urllib via {edge_url}")
+            
+            # Construct proxy payload (same format as CF Worker)
+            proxy_payload = {
+                "method": "POST",
+                "url": url,
+                "headers": headers,
+                "body": payload
+            }
+            
+            payload = proxy_payload
+            url = f"{edge_url}/proxy"
+            headers = {
+                "Content-Type": "application/json",
+                "User-Agent": user_agent
+            }
             proxy_url = None
 
         try:
@@ -381,14 +401,21 @@ class SoraClient:
         from ..core.config import config as app_config
         
         # DEBUG LOG
-        #print(f"DEBUG: Checking CF Worker proxy. Enabled: {app_config.cf_worker_upload_enabled}, URL: {app_config.cf_worker_upload_url}, Multipart: {bool(multipart)}")
+        #print(f"DEBUG: Checking upload proxy. Mode: {app_config.upload_proxy_mode}, Multipart: {bool(multipart)}")
         
-        # 如果启用了 CF Worker 代理且不是 multipart 请求，使用 CF Worker 转发
-        if app_config.cf_worker_upload_enabled and app_config.cf_worker_upload_url and not multipart:
-            #print("DEBUG: Using CF Worker proxy for request")
-            return await self._make_request_via_cf_worker(
-                method, endpoint, token, json_data, add_sentinel_token, token_id
-            )
+        # 如果启用了代理且不是 multipart 请求，使用代理转发
+        proxy_mode = app_config.upload_proxy_mode
+        if proxy_mode != "off" and not multipart:
+            if proxy_mode == "cf_worker" and app_config.cf_worker_upload_url:
+                #print("DEBUG: Using CF Worker proxy for request")
+                return await self._make_request_via_cf_worker(
+                    method, endpoint, token, json_data, add_sentinel_token, token_id
+                )
+            elif proxy_mode == "supabase_edge" and app_config.supabase_edge_url:
+                #print("DEBUG: Using Supabase Edge proxy for request")
+                return await self._make_request_via_supabase_edge(
+                    method, endpoint, token, json_data, add_sentinel_token, token_id
+                )
 
             #print("DEBUG: Using direct request")
         
@@ -627,9 +654,12 @@ class SoraClient:
         """
         from ..core.config import config as app_config
         
-        # 如果启用了 CF Worker 代理
-        if app_config.cf_worker_upload_enabled and app_config.cf_worker_upload_url:
+        # 根据代理模式选择上传方式
+        proxy_mode = app_config.upload_proxy_mode
+        if proxy_mode == "cf_worker" and app_config.cf_worker_upload_url:
             return await self._upload_via_cf_worker(image_data, token, filename)
+        elif proxy_mode == "supabase_edge" and app_config.supabase_edge_url:
+            return await self._upload_via_supabase_edge(image_data, token, filename)
         
         # 直接上传
         return await self._upload_direct(image_data, token, filename)
@@ -745,8 +775,177 @@ class SoraClient:
             
             result = response_json if response_json else response.json()
             return result["id"]
+
+    async def _make_request_via_supabase_edge(self, method: str, endpoint: str, token: str,
+                                              json_data: Optional[Dict] = None,
+                                              add_sentinel_token: bool = False,
+                                              token_id: Optional[int] = None) -> Dict[str, Any]:
+        """通过 Supabase Edge Function 代理发送请求
+
+        将请求转发到 Supabase Edge Function 的 /proxy 端点，由 Function 转发到 Sora API
+        """
+        from ..core.config import config as app_config
+        
+        edge_url = app_config.supabase_edge_url.rstrip('/')
+        target_url = f"{self.base_url}{endpoint}"
+        
+        # 构建请求头
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "User-Agent": "Sora/1.2026.007 (Android 15; 24122RKC7C; build 2600700)",
+            "Content-Type": "application/json"
+        }
+        
+        # 添加 sentinel token（如果需要）
+        if add_sentinel_token:
+            headers["openai-sentinel-token"] = await self._generate_sentinel_token(token)
+        
+        # 构建发送给 Supabase Edge Function 的 payload
+        proxy_payload = {
+            "method": method,
+            "url": target_url,
+            "headers": headers,
+            "body": json_data
+        }
+        
+        async with AsyncSession() as session:
+            kwargs = {
+                "json": proxy_payload,
+                "headers": {"Content-Type": "application/json"},
+                "timeout": self.timeout,
+                "impersonate": "chrome"
+            }
+            
+            # Log request
+            debug_logger.log_request(
+                method="POST",
+                url=f"{edge_url}/proxy",
+                headers={"Content-Type": "application/json"},
+                body={"method": method, "url": target_url, "body_keys": list(json_data.keys()) if json_data else None},
+                files=None,
+                proxy=None
+            )
+            
+            # Record start time
+            start_time = time.time()
+            
+            response = await session.post(f"{edge_url}/proxy", **kwargs)
+            
+            # Calculate duration
+            duration_ms = (time.time() - start_time) * 1000
+            
+            # Parse response
+            try:
+                response_json = response.json()
+            except:
+                response_json = None
+            
+            # Log response
+            debug_logger.log_response(
+                status_code=response.status_code,
+                headers=dict(response.headers),
+                body=response_json if response_json else response.text,
+                duration_ms=duration_ms
+            )
+            
+            # Check for Supabase Edge error
+            if response.status_code not in [200, 201]:
+                if response_json and isinstance(response_json, dict):
+                    error_info = response_json.get("error", {})
+                    if isinstance(error_info, dict) and error_info.get("code") == "unsupported_country_code":
+                        import json
+                        error_msg = json.dumps(response_json)
+                        debug_logger.log_error(
+                            error_message=f"Unsupported country (via Supabase Edge): {error_msg}",
+                            status_code=response.status_code,
+                            response_text=error_msg
+                        )
+                        raise Exception(error_msg)
+                
+                error_msg = f"Supabase Edge proxy failed: {response.status_code} - {response.text}"
+                debug_logger.log_error(
+                    error_message=error_msg,
+                    status_code=response.status_code,
+                    response_text=response.text
+                )
+                raise Exception(error_msg)
+            
+            return response_json if response_json else response.json()
+
+    async def _upload_via_supabase_edge(self, image_data: bytes, token: str, filename: str = "image.png") -> str:
+        """通过 Supabase Edge Function 代理上传图片
+
+        将图片数据 base64 编码后发送到 Supabase Edge Function，由 Function 转发上传请求到 Sora API
+        """
+        from ..core.config import config as app_config
+        
+        edge_url = app_config.supabase_edge_url.rstrip('/')
+        
+        # 将图片转为 base64
+        image_base64 = base64.b64encode(image_data).decode('utf-8')
+        
+        # 构建请求负载
+        payload = {
+            "image_data": image_base64,
+            "filename": filename,
+            "token": token,
+            "target_url": f"{self.base_url}/uploads"
+        }
+        
+        async with AsyncSession() as session:
+            kwargs = {
+                "json": payload,
+                "headers": {"Content-Type": "application/json"},
+                "timeout": self.timeout,
+                "impersonate": "chrome"
+            }
+            
+            # Log request
+            debug_logger.log_request(
+                method="POST",
+                url=f"{edge_url}/upload",
+                headers=kwargs["headers"],
+                body={"filename": filename, "target_url": payload["target_url"], "image_size": len(image_data)},
+                files=None,
+                proxy=None
+            )
+            
+            # Record start time
+            start_time = time.time()
+            
+            response = await session.post(f"{edge_url}/upload", **kwargs)
+            
+            # Calculate duration
+            duration_ms = (time.time() - start_time) * 1000
+            
+            # Parse response
+            try:
+                response_json = response.json()
+            except:
+                response_json = None
+            
+            # Log response
+            debug_logger.log_response(
+                status_code=response.status_code,
+                headers=dict(response.headers),
+                body=response_json if response_json else response.text,
+                duration_ms=duration_ms
+            )
+            
+            if response.status_code not in [200, 201]:
+                error_msg = f"Supabase Edge upload failed: {response.status_code} - {response.text}"
+                debug_logger.log_error(
+                    error_message=error_msg,
+                    status_code=response.status_code,
+                    response_text=response.text
+                )
+                raise Exception(error_msg)
+            
+            result = response_json if response_json else response.json()
+            return result["id"]
     
     async def generate_image(self, prompt: str, token: str, width: int = 360,
+
                             height: int = 360, media_id: Optional[str] = None, token_id: Optional[int] = None) -> str:
         """Generate image (text-to-image or image-to-image)"""
         operation = "remix" if media_id else "simple_compose"
