@@ -620,6 +620,16 @@ class Database:
                 return Token(**dict(row))
             return None
     
+    async def get_token_by_proxy_url(self, proxy_url: str) -> Optional[Token]:
+        """Get token by proxy_url（根据代理 URL 查询 token）"""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("SELECT * FROM tokens WHERE proxy_url = ?", (proxy_url,))
+            row = await cursor.fetchone()
+            if row:
+                return Token(**dict(row))
+            return None
+    
     async def get_active_tokens(self) -> List[Token]:
         """Get all active tokens (enabled, not cooled down, not expired)"""
         async with aiosqlite.connect(self.db_path) as db:
@@ -798,6 +808,7 @@ class Database:
             if updates:
                 params.append(token_id)
                 query = f"UPDATE tokens SET {', '.join(updates)} WHERE id = ?"
+                print(f"📝 执行SQL更新: 更新字段=[{', '.join(updates)}], token_id={token_id}")
                 await db.execute(query, params)
                 await db.commit()
 

@@ -98,22 +98,29 @@ class UpdateTokenRequest(BaseModel):
     video_concurrency: Optional[int] = None  # Video concurrency limit
 
 class ImportTokenItem(BaseModel):
+    """Token 导入项模型，支持 Chrome 扩展和网页导入"""
     email: str  # Email (primary key, required)
     access_token: Optional[str] = None  # Access Token (AT, optional for st/rt modes)
     session_token: Optional[str] = None  # Session Token (ST)
     refresh_token: Optional[str] = None  # Refresh Token (RT)
     client_id: Optional[str] = None  # Client ID (optional, for compatibility)
-    proxy_url: Optional[str] = None  # Proxy URL (optional, for compatibility)
+    proxy_url: Optional[str] = None  # Proxy URL (snake_case)
+    proxyUrl: Optional[str] = None  # Proxy URL (camelCase, for Chrome extension compatibility)
     remark: Optional[str] = None  # Remark (optional, for compatibility)
     is_active: bool = True  # Active status
     image_enabled: bool = True  # Enable image generation
     video_enabled: bool = True  # Enable video generation
     image_concurrency: int = -1  # Image concurrency limit
     video_concurrency: int = -1  # Video concurrency limit
+    
+    def get_proxy_url(self) -> Optional[str]:
+        """获取代理 URL，优先使用 proxy_url，其次使用 proxyUrl"""
+        return self.proxy_url or self.proxyUrl
 
 class ImportTokensRequest(BaseModel):
+    """Token 导入请求模型"""
     tokens: List[ImportTokenItem]
-    mode: str = "at"  # Import mode: offline/at/st/rt
+    mode: str = "auto"  # 导入模式: auto/offline/at/st/rt，默认 auto 自动检测
 
 class UpdateAdminConfigRequest(BaseModel):
     error_ban_threshold: int
@@ -484,9 +491,17 @@ async def batch_update_proxy(request: BatchUpdateProxyRequest, token: str = Depe
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/api/tokens/import")
-async def import_tokens(request: ImportTokensRequest, token: str = Depends(verify_admin_token)):
-    """Import tokens with different modes: offline/at/st/rt"""
-    mode = request.mode  # offline/at/st/rt
+async def import_tokens(request: ImportTokensRequest):
+    """Import tokens with different modes: auto/offline/at/st/rt
+    
+    模式说明：
+    - auto: 自动检测模式（默认），根据提供的 token 类型自动选择最佳导入模式
+    - offline: 离线模式，使用提供的 AT，跳过状态更新
+    - at: AT 模式，使用提供的 AT，更新状态
+    - st: ST 模式，将 ST 转换为 AT，更新状态
+    - rt: RT 模式，将 RT 转换为 AT，更新状态
+    """
+    global_mode = request.mode  # auto/offline/at/st/rt
     added_count = 0
     updated_count = 0
     failed_count = 0
@@ -494,7 +509,30 @@ async def import_tokens(request: ImportTokensRequest, token: str = Depends(verif
 
     for import_item in request.tokens:
         try:
-            # Step 1: Get or convert access_token based on mode
+            # 获取代理 URL（兼容 proxy_url 和 proxyUrl 两种字段名）
+            proxy_url = import_item.get_proxy_url()
+            
+            # Step 1: 确定实际使用的模式
+            if global_mode == "auto":
+                # 自动检测模式：根据提供的 token 类型自动选择
+                if import_item.access_token and import_item.session_token:
+                    # 同时提供了 AT 和 ST，优先使用 AT 模式（Chrome 扩展场景）
+                    mode = "at"
+                elif import_item.access_token:
+                    # 只提供了 AT
+                    mode = "at"
+                elif import_item.session_token:
+                    # 只提供了 ST
+                    mode = "st"
+                elif import_item.refresh_token:
+                    # 只提供了 RT
+                    mode = "rt"
+                else:
+                    raise ValueError("自动检测模式需要提供 access_token、session_token 或 refresh_token 中的至少一个")
+            else:
+                mode = global_mode
+            
+            # Step 2: Get or convert access_token based on mode
             access_token = None
             skip_status = False
 
@@ -519,7 +557,7 @@ async def import_tokens(request: ImportTokensRequest, token: str = Depends(verif
                 # Convert ST to AT
                 st_result = await token_manager.st_to_at(
                     import_item.session_token,
-                    proxy_url=import_item.proxy_url
+                    proxy_url=proxy_url
                 )
                 access_token = st_result["access_token"]
                 # Update email if API returned it
@@ -535,7 +573,7 @@ async def import_tokens(request: ImportTokensRequest, token: str = Depends(verif
                 rt_result = await token_manager.rt_to_at(
                     import_item.refresh_token,
                     client_id=import_item.client_id,
-                    proxy_url=import_item.proxy_url
+                    proxy_url=proxy_url
                 )
                 access_token = rt_result["access_token"]
                 # Update RT if API returned new one
@@ -548,18 +586,35 @@ async def import_tokens(request: ImportTokensRequest, token: str = Depends(verif
             else:
                 raise ValueError(f"不支持的导入模式: {mode}")
 
-            # Step 2: Check if token with this email already exists
-            existing_token = await db.get_token_by_email(import_item.email)
+            # Step 3: Check if token already exists
+            # 优先以 proxy_url 作为唯一标识，如果没有则使用 email
+            print(f"🔍 开始查找现有Token...")
+            print(f"  - 查找代理URL: {proxy_url}")
+            print(f"  - 查找Email: {import_item.email}")
+            
+            existing_token = None
+            if proxy_url:
+                # 以代理 URL 作为唯一标识查找
+                existing_token = await db.get_token_by_proxy_url(proxy_url)
+                print(f"  - 通过proxy_url查找结果: {'找到 ID=' + str(existing_token.id) if existing_token else '未找到'}")
+            if not existing_token and import_item.email:
+                # 如果没有通过 proxy_url 找到，则尝试通过 email 查找
+                existing_token = await db.get_token_by_email(import_item.email)
+                print(f"  - 通过email查找结果: {'找到 ID=' + str(existing_token.id) if existing_token else '未找到'}")
 
             if existing_token:
                 # Update existing token
+                print(f"🔄 更新现有Token: ID={existing_token.id}, Email={existing_token.email}")
+                print(f"  - 新 access_token: {'有值' if access_token else '无'} (长度: {len(access_token) if access_token else 0})")
+                print(f"  - 新 session_token: {'有值' if import_item.session_token else '无'} (长度: {len(import_item.session_token) if import_item.session_token else 0})")
+                print(f"  - 新 proxy_url: {proxy_url}")
                 await token_manager.update_token(
                     token_id=existing_token.id,
                     token=access_token,
                     st=import_item.session_token,
                     rt=import_item.refresh_token,
                     client_id=import_item.client_id,
-                    proxy_url=import_item.proxy_url,
+                    proxy_url=proxy_url,
                     remark=import_item.remark,
                     image_enabled=import_item.image_enabled,
                     video_enabled=import_item.video_enabled,
@@ -589,7 +644,7 @@ async def import_tokens(request: ImportTokensRequest, token: str = Depends(verif
                     st=import_item.session_token,
                     rt=import_item.refresh_token,
                     client_id=import_item.client_id,
-                    proxy_url=import_item.proxy_url,
+                    proxy_url=proxy_url,
                     remark=import_item.remark,
                     update_if_exists=False,
                     image_enabled=import_item.image_enabled,
